@@ -1,0 +1,1 @@
+export async function api(path:string,init?:RequestInit){const r=await fetch(`/backend${path}`,{...init,headers:{"Content-Type":"application/json",...(init?.headers||{})},cache:"no-store"});const t=await r.text();let d:any={};try{d=t?JSON.parse(t):{}}catch{d={detail:t}}if(!r.ok)throw new Error(d.detail||`HTTP ${r.status}`);return d}
