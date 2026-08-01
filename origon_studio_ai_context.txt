@@ -1,0 +1,645 @@
+# ORIGON STUDIO AI - SOURCE CONTEXT
+
+
+==========================================================================================
+FILE: .env.example
+==========================================================================================
+
+ORIGON_HOST=0.0.0.0
+ORIGON_API_PORT=8000
+ORIGON_WEB_PORT=3000
+ORIGON_STORAGE=./storage
+ORIGON_EXTERNAL_PROVIDERS=false
+ORIGON_SHOPEE_OFFICIAL=false
+
+
+==========================================================================================
+FILE: .gitignore
+==========================================================================================
+
+.env
+backend/.venv/
+backend/**/__pycache__/
+backend/**/*.pyc
+frontend/node_modules/
+frontend/.next/
+storage/database/*.db*
+storage/media/*
+storage/music/*
+storage/voice/*
+storage/compositions/*
+storage/renders/*
+storage/exports/*
+storage/backups/*
+storage/trash/*
+!storage/**/.gitkeep
+*.zip
+
+
+==========================================================================================
+FILE: README.md
+==========================================================================================
+
+# Origon Studio AI
+
+Studio pessoal para transformar produtos, links e mídias em variações de vídeos verticais para Shopee Video, Reels, TikTok e Shorts.
+
+## O que esta entrega contém
+
+- Dashboard, produtos, projetos, lotes, histórico, lixeira, configurações e diagnóstico.
+- Persistência SQLite e armazenamento local organizado.
+- Importação assistida por URL com revisão obrigatória.
+- AI Director local baseado em regras, Claim Guard e Creative Matrix.
+- 1, 3 ou 5 estratégias/roteiros por produto.
+- Fila de lotes para até 5 produtos.
+- Provider Hub com fallback local; conectores externos começam desativados.
+- Diagnóstico de FFmpeg, FFprobe, Piper, WebGPU/configuração e espaço em disco.
+- Exportação de pacote editorial: título, legenda, hashtags, palavras-chave e comentário fixado.
+- Render demonstrativo com FFmpeg quando há mídias locais válidas.
+
+## Instalação no Codespaces
+
+```bash
+chmod +x setup-origon.sh start-origon.sh diagnose-origon.sh repair-origon.sh update-origon.sh
+./setup-origon.sh
+./start-origon.sh
+```
+
+Abra a porta 3000. A API e a documentação ficam na porta 8000 (`/docs`).
+
+## Windows
+
+Use o WSL2 nesta versão. O script `scripts/setup-windows-wsl.sh` documenta o caminho. Um instalador nativo é uma evolução posterior.
+
+## Limitações honestas
+
+- A importação de URL é assistida e depende do conteúdo público acessível; não burla login, anti-bot ou restrições da Shopee.
+- Serviços gratuitos externos podem ter filas e cotas. O fluxo nunca depende deles.
+- WebLLM e ComfyUI são conectores opcionais. O motor de regras local funciona sem GPU.
+- Publicação automática na Shopee não está habilitada sem credenciais e aprovação oficiais.
+
+Consulte `docs/PRODUCT_SPEC.md`, `docs/ACCEPTANCE.md` e `docs/PROVIDERS.md`.
+
+
+==========================================================================================
+FILE: backend/app/__init__.py
+==========================================================================================
+
+
+
+==========================================================================================
+FILE: backend/app/config.py
+==========================================================================================
+
+from pathlib import Path
+import os
+BASE_DIR=Path(__file__).resolve().parents[2]
+STORAGE=Path(os.getenv('ORIGON_STORAGE', BASE_DIR/'storage')).resolve()
+DB_PATH=STORAGE/'database'/'origon.db'
+for name in ('database','media','music','voice','compositions','renders','exports','backups','trash','products','batches'):
+    (STORAGE/name).mkdir(parents=True, exist_ok=True)
+
+
+==========================================================================================
+FILE: backend/app/creative.py
+==========================================================================================
+
+import re, hashlib
+STRATEGIES=['Curiosidade','Demonstração','Dor e solução','Review','UGC','Oferta','Tutorial','Comparação','Lista de benefícios','Antes e depois']
+
+def claim_guard(product):
+    confirmed=[]
+    for label,value in [('Nome',product.get('name')),('Descrição',product.get('description')),('Benefícios',product.get('benefits')),('Preço',product.get('price'))]:
+        if value: confirmed.append({'claim':str(value),'source':label,'status':'confirmed'})
+    return {'confirmed':confirmed,'requiresApproval':[],'blocked':['preço, desconto, frete ou estoque não informados','afirmações médicas ou resultados garantidos não confirmados']}
+
+def scenes_for(product,strategy,duration):
+    name=product['name']; benefit=(product.get('benefits') or 'mais praticidade no dia a dia').split(',')[0]; audience=product.get('audience') or 'quem busca praticidade'
+    count=max(4,min(6,round(duration/3)))
+    templates=[
+      ('Gancho',f'Você já imaginou facilitar sua rotina com {name}?','Olha isso!'),
+      ('Problema',f'Para {audience}, tarefas simples não precisam tomar tanto tempo.','Menos complicação'),
+      ('Produto',f'{name} foi pensado para tornar o uso mais simples. ',name),
+      ('Benefício',f'O principal destaque é {benefit}.',benefit),
+      ('Prova','Veja os detalhes e o funcionamento nas imagens do produto.','Veja na prática'),
+      ('CTA','Confira as informações do produto antes de decidir.','Confira o produto'),
+    ]
+    if strategy=='Demonstração': templates[0]=('Gancho',f'Veja {name} funcionando na prática.','Funcionando na prática')
+    if strategy=='Dor e solução': templates[0]=('Gancho','Você também enfrenta essa dificuldade no dia a dia?','Isso acontece com você?')
+    if strategy=='Review': templates[0]=('Gancho',f'Vale a pena conhecer {name}?','Vale a pena?')
+    if strategy=='Oferta': templates[-1]=('CTA','Confira preço, disponibilidade e condições diretamente no anúncio.','Confira as condições')
+    chosen=templates[:count-1]+[templates[-1]]
+    each=round(duration/len(chosen),2)
+    return [{'order':i+1,'purpose':p,'narration':n.strip(),'screenText':t,'duration':each,'mediaRole':'video' if i<2 else 'image','transition':'fade' if i%2==0 else 'cut'} for i,(p,n,t) in enumerate(chosen)]
+
+def generate_versions(product,project):
+    n=project['versions']; seed=int(hashlib.sha1((product['name']+str(project['id'])).encode()).hexdigest()[:8],16)
+    selected=[STRATEGIES[(seed+i*3)%len(STRATEGIES)] for i in range(n)]
+    out=[]
+    for i,strategy in enumerate(selected,1):
+        scenes=scenes_for(product,strategy,project['duration'])
+        out.append({'ordinal':i,'strategy':strategy,'hook':scenes[0]['narration'],'script':{'scenes':scenes},'creative':{'style': 'Automático','captionStyle':'Palavras-chave','musicMood':'Energética' if i%2 else 'Leve','claimGuard':claim_guard(product)}})
+    return out
+
+
+==========================================================================================
+FILE: backend/app/db.py
+==========================================================================================
+
+import sqlite3, json
+from datetime import datetime, timezone
+from contextlib import contextmanager
+from .config import DB_PATH
+
+def now(): return datetime.now(timezone.utc).isoformat()
+@contextmanager
+def connect():
+    conn=sqlite3.connect(DB_PATH); conn.row_factory=sqlite3.Row; conn.execute('PRAGMA foreign_keys=ON')
+    try: yield conn; conn.commit()
+    finally: conn.close()
+
+def init_db():
+    with connect() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT DEFAULT 'Outros', description TEXT DEFAULT '', benefits TEXT DEFAULT '', audience TEXT DEFAULT '', source_url TEXT DEFAULT '', price TEXT DEFAULT '', status TEXT DEFAULT 'active', created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, name TEXT NOT NULL, platform TEXT DEFAULT 'shopee', mode TEXT DEFAULT 'assisted', duration INTEGER DEFAULT 15, versions INTEGER DEFAULT 3, language TEXT DEFAULT 'pt-BR', status TEXT DEFAULT 'draft', settings_json TEXT DEFAULT '{}', created_at TEXT, updated_at TEXT, FOREIGN KEY(product_id) REFERENCES products(id));
+        CREATE TABLE IF NOT EXISTS versions(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, ordinal INTEGER, strategy TEXT, hook TEXT, script_json TEXT, creative_json TEXT, status TEXT DEFAULT 'draft', output_path TEXT DEFAULT '', created_at TEXT, updated_at TEXT, FOREIGN KEY(project_id) REFERENCES projects(id));
+        CREATE TABLE IF NOT EXISTS batches(id INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT DEFAULT 'draft', product_ids_json TEXT DEFAULT '[]', versions INTEGER DEFAULT 3, progress INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, batch_id INTEGER, project_id INTEGER, version_id INTEGER, status TEXT DEFAULT 'queued', progress INTEGER DEFAULT 0, message TEXT DEFAULT '', created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, entity_type TEXT, entity_id INTEGER, action TEXT, detail_json TEXT DEFAULT '{}', created_at TEXT);
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS trash(id INTEGER PRIMARY KEY, entity_type TEXT, entity_id INTEGER, payload_json TEXT, deleted_at TEXT);
+        """)
+
+def rows(sql,args=()):
+    with connect() as c: return [dict(x) for x in c.execute(sql,args).fetchall()]
+def one(sql,args=()):
+    with connect() as c:
+        x=c.execute(sql,args).fetchone(); return dict(x) if x else None
+def execute(sql,args=()):
+    with connect() as c:
+        cur=c.execute(sql,args); return cur.lastrowid
+
+def log(entity_type, entity_id, action, detail=None):
+    execute('INSERT INTO history(entity_type,entity_id,action,detail_json,created_at) VALUES(?,?,?,?,?)',(entity_type,entity_id,action,json.dumps(detail or {},ensure_ascii=False),now()))
+
+
+==========================================================================================
+FILE: backend/app/importer.py
+==========================================================================================
+
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from html.parser import HTMLParser
+import ipaddress, socket
+
+class MetaParser(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.meta={}; self.title=''; self._title=False
+    def handle_starttag(self, tag, attrs):
+        data=dict(attrs)
+        if tag.lower()=='meta':
+            key=data.get('property') or data.get('name')
+            if key and data.get('content'): self.meta[key.lower()]=data['content'].strip()
+        if tag.lower()=='title': self._title=True
+    def handle_endtag(self, tag):
+        if tag.lower()=='title': self._title=False
+    def handle_data(self,data):
+        if self._title: self.title+=data
+
+def safe_url(url):
+    p=urlparse(url)
+    if p.scheme not in ('http','https') or not p.hostname: raise ValueError('URL inválida')
+    for info in socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme=='https' else 80)):
+        ip=ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local: raise ValueError('Host privado não permitido')
+
+def extract(url):
+    safe_url(url)
+    req=Request(url,headers={'User-Agent':'Mozilla/5.0 OrigonStudioAI/1.0'})
+    with urlopen(req,timeout=12) as response: html=response.read(800000).decode('utf-8','ignore')
+    parser=MetaParser(); parser.feed(html)
+    name=parser.meta.get('og:title') or parser.title.strip() or 'Produto importado'
+    return {'name':name[:160],'description':parser.meta.get('og:description') or parser.meta.get('description',''),'image':parser.meta.get('og:image',''),'source_url':url,'requiresReview':True,'notice':'Importação assistida: confirme os dados e os direitos de uso das mídias.'}
+
+
+==========================================================================================
+FILE: backend/app/main.py
+==========================================================================================
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+import json, shutil, subprocess, platform
+from .db import init_db, rows, one, execute, log, now, connect
+from .schemas import ProductIn, ProjectIn, BatchIn, ImportUrlIn, GenerateIn, SettingIn
+from .creative import generate_versions, claim_guard
+from .importer import extract
+from .config import STORAGE
+
+app=FastAPI(title='Origon Studio AI API',version='0.1.0')
+app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*'])
+@app.on_event('startup')
+def startup(): init_db()
+@app.get('/health')
+def health(): return {'status':'healthy','service':'origon-studio-ai'}
+@app.get('/api/dashboard')
+def dashboard():
+    return {'products':one('SELECT COUNT(*) n FROM products WHERE status="active"')['n'],'projects':one('SELECT COUNT(*) n FROM projects')['n'],'batches':one('SELECT COUNT(*) n FROM batches')['n'],'jobs':one('SELECT COUNT(*) n FROM jobs')['n'],'recent':rows('SELECT * FROM history ORDER BY id DESC LIMIT 10')}
+@app.get('/api/products')
+def list_products(): return rows('SELECT * FROM products WHERE status="active" ORDER BY id DESC')
+@app.post('/api/products')
+def create_product(body:ProductIn):
+    i=execute('INSERT INTO products(name,category,description,benefits,audience,source_url,price,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,"active",?,?)',(body.name,body.category,body.description,body.benefits,body.audience,body.source_url,body.price,now(),now())); log('product',i,'created'); return one('SELECT * FROM products WHERE id=?',(i,))
+@app.get('/api/products/{pid}')
+def get_product(pid:int):
+    x=one('SELECT * FROM products WHERE id=?',(pid,));
+    if not x: raise HTTPException(404,'Produto não encontrado')
+    return x
+@app.put('/api/products/{pid}')
+def update_product(pid:int,body:ProductIn):
+    execute('UPDATE products SET name=?,category=?,description=?,benefits=?,audience=?,source_url=?,price=?,updated_at=? WHERE id=?',(body.name,body.category,body.description,body.benefits,body.audience,body.source_url,body.price,now(),pid)); log('product',pid,'updated'); return get_product(pid)
+@app.delete('/api/products/{pid}')
+def delete_product(pid:int):
+    x=get_product(pid); execute('INSERT INTO trash(entity_type,entity_id,payload_json,deleted_at) VALUES("product",?,?,?)',(pid,json.dumps(x,ensure_ascii=False),now())); execute('UPDATE products SET status="trash" WHERE id=?',(pid,)); log('product',pid,'trashed'); return {'ok':True}
+@app.post('/api/import/url')
+def import_url(body:ImportUrlIn):
+    try:return extract(str(body.url))
+    except Exception as e: raise HTTPException(422,f'Não foi possível importar automaticamente: {e}')
+@app.get('/api/projects')
+def projects(): return rows('SELECT p.*,pr.name product_name FROM projects p JOIN products pr ON pr.id=p.product_id ORDER BY p.id DESC')
+@app.post('/api/projects')
+def create_project(body:ProjectIn):
+    if not one('SELECT id FROM products WHERE id=?',(body.product_id,)): raise HTTPException(404,'Produto não encontrado')
+    i=execute('INSERT INTO projects(product_id,name,platform,mode,duration,versions,language,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,"draft",?,?)',(body.product_id,body.name,body.platform,body.mode,body.duration,body.versions,body.language,now(),now())); log('project',i,'created'); return one('SELECT * FROM projects WHERE id=?',(i,))
+@app.get('/api/projects/{pid}')
+def get_project(pid:int):
+    x=one('SELECT p.*,pr.name product_name,pr.description,pr.benefits,pr.audience FROM projects p JOIN products pr ON pr.id=p.product_id WHERE p.id=?',(pid,));
+    if not x: raise HTTPException(404,'Projeto não encontrado')
+    x['versions_data']=rows('SELECT * FROM versions WHERE project_id=? ORDER BY ordinal',(pid,)); return x
+@app.post('/api/generate')
+def generate(body:GenerateIn):
+    project=one('SELECT * FROM projects WHERE id=?',(body.project_id,));
+    if not project: raise HTTPException(404,'Projeto não encontrado')
+    product=one('SELECT * FROM products WHERE id=?',(project['product_id'],)); execute('DELETE FROM versions WHERE project_id=?',(project['id'],))
+    generated=generate_versions(product,project)
+    for v in generated: execute('INSERT INTO versions(project_id,ordinal,strategy,hook,script_json,creative_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,"ready",?,?)',(project['id'],v['ordinal'],v['strategy'],v['hook'],json.dumps(v['script'],ensure_ascii=False),json.dumps(v['creative'],ensure_ascii=False),now(),now()))
+    execute('UPDATE projects SET status="ready",updated_at=? WHERE id=?',(now(),project['id'])); log('project',project['id'],'generated',{'versions':len(generated)}); return get_project(project['id'])
+@app.get('/api/batches')
+def list_batches(): return rows('SELECT * FROM batches ORDER BY id DESC')
+@app.post('/api/batches')
+def create_batch(body:BatchIn):
+    i=execute('INSERT INTO batches(name,status,product_ids_json,versions,progress,created_at,updated_at) VALUES(?,"draft",?,?,0,?,?)',(body.name,json.dumps(body.product_ids),body.versions,now(),now())); log('batch',i,'created'); return one('SELECT * FROM batches WHERE id=?',(i,))
+@app.post('/api/batches/{bid}/prepare')
+def prepare_batch(bid:int):
+    b=one('SELECT * FROM batches WHERE id=?',(bid,));
+    if not b: raise HTTPException(404,'Lote não encontrado')
+    ids=json.loads(b['product_ids_json']); created=[]
+    for product_id in ids:
+        product=one('SELECT * FROM products WHERE id=?',(product_id,));
+        if not product: continue
+        project_id=execute('INSERT INTO projects(product_id,name,platform,mode,duration,versions,language,status,created_at,updated_at) VALUES(?,?,"shopee","assisted",15,?,"pt-BR","draft",?,?)',(product_id,f'Lote {bid} - {product["name"]}',b['versions'],now(),now()))
+        generate(GenerateIn(project_id=project_id)); created.append(project_id)
+        for v in rows('SELECT id FROM versions WHERE project_id=?',(project_id,)): execute('INSERT INTO jobs(batch_id,project_id,version_id,status,progress,message,created_at,updated_at) VALUES(?,?,?,"ready",0,"Aguardando mídias e render",?,?)',(bid,project_id,v['id'],now(),now()))
+    execute('UPDATE batches SET status="ready",progress=25,updated_at=? WHERE id=?',(now(),bid)); log('batch',bid,'prepared',{'projects':created}); return {'batch':one('SELECT * FROM batches WHERE id=?',(bid,)),'projects':created,'jobs':rows('SELECT * FROM jobs WHERE batch_id=?',(bid,))}
+@app.get('/api/history')
+def history(): return rows('SELECT * FROM history ORDER BY id DESC LIMIT 200')
+@app.get('/api/trash')
+def trash(): return rows('SELECT * FROM trash ORDER BY id DESC')
+@app.post('/api/trash/{tid}/restore')
+def restore(tid:int):
+    x=one('SELECT * FROM trash WHERE id=?',(tid,));
+    if not x: raise HTTPException(404,'Item não encontrado')
+    if x['entity_type']=='product': execute('UPDATE products SET status="active",updated_at=? WHERE id=?',(now(),x['entity_id']))
+    execute('DELETE FROM trash WHERE id=?',(tid,)); return {'ok':True}
+@app.get('/api/settings')
+def settings(): return {x['key']:json.loads(x['value_json']) for x in rows('SELECT * FROM settings')}
+@app.put('/api/settings/{key}')
+def set_setting(key:str,body:SettingIn): execute('INSERT OR REPLACE INTO settings(key,value_json,updated_at) VALUES(?,?,?)',(key,json.dumps(body.value,ensure_ascii=False),now())); return {'ok':True}
+@app.get('/api/diagnostics')
+def diagnostics():
+    def cmd(name):
+        path=shutil.which(name); return {'ok':bool(path),'path':path}
+    disk=shutil.disk_usage(STORAGE)
+    return {'overall':'ready' if cmd('ffmpeg')['ok'] else 'warning','python':platform.python_version(),'ffmpeg':cmd('ffmpeg'),'ffprobe':cmd('ffprobe'),'piper':cmd('piper'),'database':{'ok':STORAGE.joinpath('database','origon.db').exists(),'path':str(STORAGE.joinpath('database','origon.db'))},'storage':{'path':str(STORAGE),'freeGB':round(disk.free/1024**3,2)},'providers':{'externalEnabled':False,'webllm':'browser-check-required','comfyui':'not-configured','huggingface':'not-configured'}}
+@app.post('/api/repair')
+def repair(): init_db(); return {'ok':True,'message':'Banco e pastas verificados.'}
+
+
+==========================================================================================
+FILE: backend/app/schemas.py
+==========================================================================================
+
+from pydantic import BaseModel, Field, HttpUrl
+from typing import Any
+class ProductIn(BaseModel):
+    name:str=Field(min_length=2,max_length=160); category:str='Outros'; description:str=''; benefits:str=''; audience:str=''; source_url:str=''; price:str=''
+class ProjectIn(BaseModel):
+    product_id:int; name:str; platform:str='shopee'; mode:str='assisted'; duration:int=15; versions:int=Field(default=3,ge=1,le=5); language:str='pt-BR'
+class BatchIn(BaseModel):
+    name:str; product_ids:list[int]=Field(min_length=1,max_length=5); versions:int=Field(default=3,ge=1,le=5)
+class ImportUrlIn(BaseModel): url:HttpUrl
+class GenerateIn(BaseModel): project_id:int
+class SettingIn(BaseModel): value:Any
+
+
+==========================================================================================
+FILE: backend/requirements.txt
+==========================================================================================
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
+piper-tts==1.5.0
+
+
+==========================================================================================
+FILE: diagnose-origon.sh
+==========================================================================================
+
+#!/usr/bin/env bash
+set -u
+for cmd in python3 node npm ffmpeg ffprobe; do printf '%-10s' "$cmd"; command -v "$cmd" || true; done
+curl -fsS http://127.0.0.1:8000/health 2>/dev/null || echo "API offline"
+curl -fsS http://127.0.0.1:3000 2>/dev/null >/dev/null && echo "Frontend OK" || echo "Frontend offline"
+
+
+==========================================================================================
+FILE: docs/ACCEPTANCE.md
+==========================================================================================
+
+# Roteiro de aceite
+1. Diagnóstico mostra API, banco e espaço.
+2. Criar três produtos.
+3. Criar projeto com três versões e confirmar estratégias distintas.
+4. Criar lote 3 x 3 e confirmar nove jobs preparados.
+5. Excluir/restaurar um produto.
+6. Reiniciar e confirmar persistência.
+7. Validar que preço não informado não aparece nos roteiros.
+
+
+==========================================================================================
+FILE: docs/PRODUCT_SPEC.md
+==========================================================================================
+
+# Especificação resumida
+Origon Studio AI é um estúdio pessoal para produtos diversos, com modo automático, assistido e manual; 1, 3 ou 5 versões; Shopee, Reels, TikTok e Shorts; SQLite; lotes de até 5 produtos; Claim Guard; Creative Matrix; fallback local e Provider Hub opcional.
+
+
+==========================================================================================
+FILE: docs/PROVIDERS.md
+==========================================================================================
+
+# Providers
+O núcleo funciona sem provider externo. WebLLM é planejado no navegador quando WebGPU estiver disponível. ComfyUI e Hugging Face são conectores experimentais e devem permanecer desligados até o usuário autorizar envio automático de prompts e imagens. Nunca armazenar chaves no Git.
+
+
+==========================================================================================
+FILE: frontend/app/batches/page.tsx
+==========================================================================================
+
+"use client";import{useEffect,useState}from"react";import{api}from"../../lib/api";export default function Page(){const[p,setP]=useState<any[]>([]),[b,setB]=useState<any[]>([]),[name,setName]=useState("Lote de validação"),[ids,setIds]=useState<number[]>([]);const load=()=>Promise.all([api("/api/products").then(setP),api("/api/batches").then(setB)]);useEffect(()=>{load()},[]);async function create(){await api("/api/batches",{method:"POST",body:JSON.stringify({name,product_ids:ids,versions:3})});load()}async function prep(id:number){await api(`/api/batches/${id}/prepare`,{method:"POST"});load()}return <><h1>Lotes</h1><p className="muted">Até cinco produtos. Padrão de validação: 3 × 3 versões.</p><div className="card form"><label className="field">Nome<input value={name} onChange={e=>setName(e.target.value)}/></label><div>{p.map(x=><label key={x.id} style={{display:"block",margin:8}}><input type="checkbox" checked={ids.includes(x.id)} onChange={e=>setIds(e.target.checked?[...ids,x.id]:ids.filter(i=>i!==x.id))}/> {x.name}</label>)}</div><button className="btn" disabled={!ids.length||ids.length>5} onClick={create}>Criar lote</button></div><div className="list">{b.map(x=><div className="item" key={x.id}><div><b>{x.name}</b><div className="muted">{x.versions} versões · progresso {x.progress}%</div></div><button className="btn secondary" onClick={()=>prep(x.id)}>Preparar projetos</button></div>)}</div></>}
+
+==========================================================================================
+FILE: frontend/app/diagnostics/page.tsx
+==========================================================================================
+
+"use client";import{useEffect,useState}from"react";import{api}from"../../lib/api";export default function Page(){const[d,setD]=useState<any>();const load=()=>api("/api/diagnostics").then(setD);useEffect(()=>{load()},[]);async function repair(){await api("/api/repair",{method:"POST"});load()}return <><div className="top"><h1>Diagnóstico</h1><button className="btn" onClick={repair}>Reparar o que for seguro</button></div>{d&&<div className="grid">{["ffmpeg","ffprobe","piper","database"].map(k=><div className="card" key={k}><h2>{k}</h2><span className="pill">{d[k]?.ok?"OK":"Atenção"}</span><p className="muted">{d[k]?.path||"Não encontrado"}</p></div>)}<div className="card"><h2>Armazenamento</h2><div className="metric">{d.storage.freeGB} GB</div><p className="muted">livres</p></div></div>}</>}
+
+==========================================================================================
+FILE: frontend/app/globals.css
+==========================================================================================
+
+*{box-sizing:border-box}body{margin:0;background:#08090d;color:#f5f5f7;font-family:Inter,ui-sans-serif,system-ui}a{color:inherit;text-decoration:none}button,input,textarea,select{font:inherit}.shell{display:grid;grid-template-columns:240px 1fr;min-height:100vh}.side{border-right:1px solid #262733;background:#0d0e14;padding:24px;position:sticky;top:0;height:100vh}.brand{font-size:20px;font-weight:800;margin-bottom:30px}.brand b{color:#9b7cff}.nav{display:grid;gap:8px}.nav a{padding:12px 14px;border-radius:12px;color:#a7a8b3}.nav a:hover{background:#181a24;color:white}.main{padding:36px;max-width:1440px;width:100%}.top{display:flex;justify-content:space-between;gap:16px;align-items:center}.hero{margin-top:28px;padding:34px;border:1px solid #34304b;border-radius:24px;background:linear-gradient(135deg,#251c48,#11131d)}h1{font-size:38px;margin:8px 0}h2{margin:0 0 14px}.muted{color:#a4a6b1;line-height:1.6}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:20px}.card{background:#11131a;border:1px solid #292b36;border-radius:18px;padding:20px}.metric{font-size:30px;font-weight:800}.btn{border:0;border-radius:12px;background:#7c5cff;color:white;padding:12px 18px;font-weight:700;cursor:pointer}.btn.secondary{background:#1b1e29}.btn.danger{background:#8c3040}.form{display:grid;gap:14px}.field{display:grid;gap:7px}.field input,.field textarea,.field select{padding:12px;border:1px solid #30323e;background:#0c0e14;color:white;border-radius:10px}.row{display:flex;gap:12px;flex-wrap:wrap}.list{display:grid;gap:12px;margin-top:18px}.item{display:flex;justify-content:space-between;align-items:center;gap:18px;background:#11131a;border:1px solid #292b36;border-radius:14px;padding:16px}.pill{font-size:12px;padding:5px 9px;border-radius:99px;background:#25213b;color:#c9bfff}.notice{padding:13px;border-radius:12px;background:#14251d;color:#98e6b7;margin:14px 0}.error{background:#34171c;color:#ffb1bd}@media(max-width:800px){.shell{grid-template-columns:1fr}.side{height:auto;position:relative}.main{padding:22px}.nav{grid-template-columns:repeat(3,1fr)}h1{font-size:30px}}
+
+==========================================================================================
+FILE: frontend/app/history/page.tsx
+==========================================================================================
+
+"use client";import{useEffect,useState}from"react";import{api}from"../../lib/api";export default function Page(){const[x,setX]=useState<any[]>([]);useEffect(()=>{api("/api/history").then(setX)},[]);return <><h1>Histórico</h1><div className="list">{x.map((i:any)=><div className="item" key={i.id}><div><b>{i.action||i.entity_type}</b><div className="muted">{i.created_at||i.deleted_at}</div></div></div>)}{!x.length&&<div className="card muted">Nenhum registro.</div>}</div></>}
+
+==========================================================================================
+FILE: frontend/app/layout.tsx
+==========================================================================================
+
+import "./globals.css"; import Link from "next/link"; export const metadata={title:"Origon Studio AI",description:"AI commerce video studio"}; const nav=[["Dashboard","/"],["Produtos","/products"],["Projetos","/projects"],["Lotes","/batches"],["Diagnóstico","/diagnostics"],["Histórico","/history"],["Lixeira","/trash"]]; export default function Layout({children}:{children:React.ReactNode}){return <html lang="pt-BR"><body><div className="shell"><aside className="side"><div className="brand"><b>Origon</b> Studio AI</div><nav className="nav">{nav.map(([a,b])=><Link key={b} href={b}>{a}</Link>)}</nav></aside><main className="main">{children}</main></div></body></html>}
+
+==========================================================================================
+FILE: frontend/app/page.tsx
+==========================================================================================
+
+"use client";import Link from "next/link";import{useEffect,useState}from"react";import{api}from"../lib/api";export default function Page(){const[d,setD]=useState<any>();useEffect(()=>{api("/api/dashboard").then(setD).catch(()=>{})},[]);return <><div className="top"><div><span className="pill">MVP pessoal robusto</span><h1>Origon Studio AI</h1><p className="muted">Produtos, estratégias, roteiros e lotes com fallback local.</p></div><Link className="btn" href="/products/new">Novo produto</Link></div><section className="hero"><h2>Da página do produto às variações criativas</h2><p className="muted">Cadastre ou importe um produto, gere até cinco estratégias e prépare lotes para Shopee, Reels, TikTok e Shorts.</p><div className="row"><Link className="btn" href="/products/new">Começar agora</Link><Link className="btn secondary" href="/batches">Abrir lotes</Link></div></section><div className="grid">{[["Produtos",d?.products||0],["Projetos",d?.projects||0],["Lotes",d?.batches||0],["Jobs",d?.jobs||0]].map(([a,b])=><div className="card" key={a}><div className="muted">{a}</div><div className="metric">{b}</div></div>)}</div><div className="grid"><div className="card"><h2>Claim Guard</h2><p className="muted">Evita preço, desconto e promessas não confirmadas.</p></div><div className="card"><h2>Creative Matrix</h2><p className="muted">Estratégias realmente diferentes, não cópias superficiais.</p></div><div className="card"><h2>Fallback local</h2><p className="muted">O fluxo continua mesmo sem IA externa.</p></div></div></> }
+
+==========================================================================================
+FILE: frontend/app/products/new/page.tsx
+==========================================================================================
+
+"use client";import{useState}from"react";import{useRouter}from"next/navigation";import{api}from"../../../lib/api";export default function Page(){const r=useRouter();const[f,setF]=useState<any>({name:"",category:"Outros",description:"",benefits:"",audience:"",source_url:"",price:""});const[msg,setMsg]=useState("");const set=(k:string,v:string)=>setF({...f,[k]:v});async function imp(){try{const d=await api("/api/import/url",{method:"POST",body:JSON.stringify({url:f.source_url})});setF({...f,...d});setMsg(d.notice)}catch(e:any){setMsg(e.message)}}async function save(e:any){e.preventDefault();const p=await api("/api/products",{method:"POST",body:JSON.stringify(f)});r.push(`/projects/new?product=${p.id}`)}return <><h1>Novo produto</h1><p className="muted">Use cadastro manual ou importação assistida. Revise tudo antes de gerar.</p>{msg&&<div className="notice">{msg}</div>}<form className="form card" onSubmit={save}><label className="field">Link do produto<input value={f.source_url} onChange={e=>set("source_url",e.target.value)}/></label><button type="button" className="btn secondary" onClick={imp}>Tentar importar link</button><label className="field">Nome<input required value={f.name} onChange={e=>set("name",e.target.value)}/></label><label className="field">Categoria<input value={f.category} onChange={e=>set("category",e.target.value)}/></label><label className="field">Descrição<textarea rows={4} value={f.description} onChange={e=>set("description",e.target.value)}/></label><label className="field">Benefícios confirmados<textarea rows={3} value={f.benefits} onChange={e=>set("benefits",e.target.value)}/></label><label className="field">Público<input value={f.audience} onChange={e=>set("audience",e.target.value)}/></label><label className="field">Preço/condição confirmada<input value={f.price} onChange={e=>set("price",e.target.value)}/></label><button className="btn">Salvar e criar projeto</button></form></>}
+
+==========================================================================================
+FILE: frontend/app/products/page.tsx
+==========================================================================================
+
+"use client";import Link from"next/link";import{useEffect,useState}from"react";import{api}from"../../lib/api";export default function Page(){const[x,setX]=useState<any[]>([]);const load=()=>api("/api/products").then(setX);useEffect(()=>{load()},[]);async function del(id:number){await api(`/api/products/${id}`,{method:"DELETE"});load()}return <><div className="top"><div><h1>Produtos</h1><p className="muted">Fontes confirmadas para roteiros seguros.</p></div><Link className="btn" href="/products/new">Novo produto</Link></div><div className="list">{x.map(p=><div className="item" key={p.id}><div><b>{p.name}</b><div className="muted">{p.category} · {p.audience||"Público não informado"}</div></div><div className="row"><Link className="btn secondary" href={`/projects/new?product=${p.id}`}>Criar projeto</Link><button className="btn danger" onClick={()=>del(p.id)}>Lixeira</button></div></div>)}{!x.length&&<div className="card muted">Nenhum produto cadastrado.</div>}</div></>}
+
+==========================================================================================
+FILE: frontend/app/projects/[id]/page.tsx
+==========================================================================================
+
+"use client";import{useEffect,useState}from"react";import{useParams}from"next/navigation";import{api}from"../../../lib/api";export default function Page(){const{id}=useParams();const[p,setP]=useState<any>();const load=()=>api(`/api/projects/${id}`).then(setP);useEffect(()=>{load()},[id]);if(!p)return <p>Carregando...</p>;return <><h1>{p.name}</h1><p className="muted">{p.product_name} · {p.platform} · {p.duration}s · {p.mode}</p><div className="notice">Claim Guard: preços, descontos e promessas não confirmadas não são inventados.</div><div className="grid">{p.versions_data.map((v:any)=>{const s=JSON.parse(v.script_json);return <div className="card" key={v.id}><span className="pill">Versão {v.ordinal}</span><h2>{v.strategy}</h2><p className="muted">{v.hook}</p><div className="list">{s.scenes.map((c:any)=><div key={c.order}><b>{c.order}. {c.purpose}</b><div className="muted">{c.narration}</div></div>)}</div></div>})}</div></>}
+
+==========================================================================================
+FILE: frontend/app/projects/new/page.tsx
+==========================================================================================
+
+"use client";import{useEffect,useState}from"react";import{useRouter}from"next/navigation";import{api}from"../../../lib/api";export default function Page(){const r=useRouter();const[products,setProducts]=useState<any[]>([]);const[f,setF]=useState<any>({product_id:0,name:"Campanha de produto",platform:"shopee",mode:"assisted",duration:15,versions:3,language:"pt-BR"});useEffect(()=>{api("/api/products").then(setProducts);const id=Number(new URLSearchParams(window.location.search).get("product")||0);if(id)setF((v:any)=>({...v,product_id:id}))},[]);async function go(e:any){e.preventDefault();const p=await api("/api/projects",{method:"POST",body:JSON.stringify(f)});await api("/api/generate",{method:"POST",body:JSON.stringify({project_id:p.id})});r.push(`/projects/${p.id}`)}return <><h1>Novo projeto</h1><form className="form card" onSubmit={go}><label className="field">Produto<select value={f.product_id} onChange={e=>setF({...f,product_id:Number(e.target.value)})} required><option value="">Selecione</option>{products.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label><label className="field">Nome<input value={f.name} onChange={e=>setF({...f,name:e.target.value})}/></label><div className="grid"><label className="field">Plataforma<select value={f.platform} onChange={e=>setF({...f,platform:e.target.value})}><option value="shopee">Shopee</option><option value="reels">Reels</option><option value="tiktok">TikTok</option><option value="shorts">Shorts</option></select></label><label className="field">Modo<select value={f.mode} onChange={e=>setF({...f,mode:e.target.value})}><option value="automatic">Piloto automático</option><option value="assisted">Assistido</option><option value="manual">Manual</option></select></label><label className="field">Duração<select value={f.duration} onChange={e=>setF({...f,duration:Number(e.target.value)})}>{[10,15,20,30,45,60].map(x=><option key={x}>{x}</option>)}</select></label><label className="field">Versões<select value={f.versions} onChange={e=>setF({...f,versions:Number(e.target.value)})}>{[1,3,5].map(x=><option key={x}>{x}</option>)}</select></label></div><button className="btn">Criar e gerar estratégias</button></form></>}
+
+==========================================================================================
+FILE: frontend/app/projects/page.tsx
+==========================================================================================
+
+"use client";import Link from"next/link";import{useEffect,useState}from"react";import{api}from"../../lib/api";export default function Page(){const[x,setX]=useState<any[]>([]);useEffect(()=>{api("/api/projects").then(setX)},[]);return <><div className="top"><div><h1>Projetos</h1><p className="muted">Estratégias e versões geradas.</p></div><Link className="btn" href="/projects/new">Novo projeto</Link></div><div className="list">{x.map(p=><Link href={`/projects/${p.id}`} className="item" key={p.id}><div><b>{p.name}</b><div className="muted">{p.product_name} · {p.platform} · {p.duration}s</div></div><span className="pill">{p.status}</span></Link>)}</div></>}
+
+==========================================================================================
+FILE: frontend/lib/api.ts
+==========================================================================================
+
+export async function api(path:string,init?:RequestInit){const r=await fetch(`/backend${path}`,{...init,headers:{"Content-Type":"application/json",...(init?.headers||{})},cache:"no-store"});const t=await r.text();let d:any={};try{d=t?JSON.parse(t):{}}catch{d={detail:t}}if(!r.ok)throw new Error(d.detail||`HTTP ${r.status}`);return d}
+
+==========================================================================================
+FILE: frontend/next-env.d.ts
+==========================================================================================
+
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+import "./.next/dev/types/routes.d.ts";
+
+// NOTE: This file should not be edited
+// see https://nextjs.org/docs/app/api-reference/config/typescript for more information.
+
+
+==========================================================================================
+FILE: frontend/next.config.ts
+==========================================================================================
+
+import type { NextConfig } from "next"; const config:NextConfig={async rewrites(){return[{source:"/backend/:path*",destination:"http://127.0.0.1:8000/:path*"}]}}; export default config;
+
+==========================================================================================
+FILE: frontend/package.json
+==========================================================================================
+
+{
+  "name": "origon-studio-ai",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "16.2.10",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19"
+  }
+}
+
+==========================================================================================
+FILE: frontend/tsconfig.json
+==========================================================================================
+
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ]
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
+
+
+==========================================================================================
+FILE: repair-origon.sh
+==========================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$ROOT"/storage/{database,media,music,voice,compositions,renders,exports,backups,trash,products,batches}
+find "$ROOT/backend" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+rm -rf "$ROOT/frontend/.next"
+echo "Pastas e caches reparados. Dados SQLite preservados."
+
+
+==========================================================================================
+FILE: scripts/setup-windows-wsl.sh
+==========================================================================================
+
+#!/usr/bin/env bash
+echo "No Windows: instale WSL2 Ubuntu, clone o repositorio dentro do WSL e execute ./setup-origon.sh"
+
+
+==========================================================================================
+FILE: setup-origon.sh
+==========================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+command -v ffmpeg >/dev/null || { echo "Instale FFmpeg: sudo apt-get update && sudo apt-get install -y ffmpeg"; exit 1; }
+python3 -m venv "$ROOT/backend/.venv"
+source "$ROOT/backend/.venv/bin/activate"
+pip install --upgrade pip
+pip install -r "$ROOT/backend/requirements.txt"
+cd "$ROOT/frontend" && npm install
+python -c "from app.main import app" 2>/dev/null || true
+echo "Setup concluido. Execute ./start-origon.sh"
+
+
+==========================================================================================
+FILE: start-origon.sh
+==========================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cleanup(){ kill ${API_PID:-0} ${WEB_PID:-0} 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+cd "$ROOT/backend"; source .venv/bin/activate
+ORIGON_STORAGE="$ROOT/storage" uvicorn app.main:app --reload --host 0.0.0.0 --port 8000 & API_PID=$!
+cd "$ROOT/frontend"; npm run dev -- --hostname 0.0.0.0 --port 3000 & WEB_PID=$!
+echo "Origon Studio AI: http://localhost:3000 | API: http://localhost:8000/docs"
+wait
+
+
+==========================================================================================
+FILE: tests/test_core.py
+==========================================================================================
+
+import tempfile, os
+from pathlib import Path
+os.environ['ORIGON_STORAGE']=tempfile.mkdtemp()
+from app.db import init_db, one
+from app.creative import generate_versions, claim_guard
+
+def test_database():
+    init_db(); assert one('SELECT COUNT(*) n FROM products')['n']==0
+
+def test_versions():
+    p={'id':1,'name':'Produto teste','description':'','benefits':'praticidade','audience':'pessoas'}
+    project={'id':1,'versions':3,'duration':15}
+    assert len(generate_versions(p,project))==3
+
+def test_claim_guard():
+    c=claim_guard({'name':'X','description':'','benefits':'','price':''})
+    assert c['blocked']
+
+
+==========================================================================================
+FILE: update-origon.sh
+==========================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+git pull --ff-only
+source backend/.venv/bin/activate
+pip install -r backend/requirements.txt
+cd frontend && npm install
+
