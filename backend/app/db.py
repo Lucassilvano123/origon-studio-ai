@@ -34,3 +34,24 @@ def execute(sql,args=()):
 
 def log(entity_type, entity_id, action, detail=None):
     execute('INSERT INTO history(entity_type,entity_id,action,detail_json,created_at) VALUES(?,?,?,?,?)',(entity_type,entity_id,action,json.dumps(detail or {},ensure_ascii=False),now()))
+
+def init_media_db():
+    with connect() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS media(
+          id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, original_name TEXT,
+          stored_name TEXT NOT NULL, media_type TEXT NOT NULL, mime_type TEXT,
+          size_bytes INTEGER DEFAULT 0, width INTEGER DEFAULT 0, height INTEGER DEFAULT 0,
+          duration REAL DEFAULT 0, has_audio INTEGER DEFAULT 0, favorite INTEGER DEFAULT 0,
+          blocked INTEGER DEFAULT 0, origin TEXT DEFAULT 'upload', created_at TEXT,
+          FOREIGN KEY(product_id) REFERENCES products(id));
+        CREATE TABLE IF NOT EXISTS scene_media(
+          id INTEGER PRIMARY KEY, version_id INTEGER NOT NULL, scene_order INTEGER NOT NULL,
+          media_id INTEGER NOT NULL, start_time REAL DEFAULT 0, created_at TEXT,
+          UNIQUE(version_id, scene_order),
+          FOREIGN KEY(version_id) REFERENCES versions(id), FOREIGN KEY(media_id) REFERENCES media(id));
+        CREATE TABLE IF NOT EXISTS render_jobs(
+          id INTEGER PRIMARY KEY, version_id INTEGER NOT NULL, status TEXT DEFAULT 'queued',
+          progress INTEGER DEFAULT 0, message TEXT DEFAULT '', output_path TEXT DEFAULT '',
+          quality_json TEXT DEFAULT '{}', created_at TEXT, updated_at TEXT);
+        """)

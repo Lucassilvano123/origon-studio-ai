@@ -37,3 +37,18 @@ Use o WSL2 nesta versão. O script `scripts/setup-windows-wsl.sh` documenta o ca
 - Publicação automática na Shopee não está habilitada sem credenciais e aprovação oficiais.
 
 Consulte `docs/PRODUCT_SPEC.md`, `docs/ACCEPTANCE.md` e `docs/PROVIDERS.md`.
+
+## Novidades v0.2
+
+- Biblioteca persistente de imagens e vídeos por produto.
+- FFprobe: resolução, duração e presença de áudio.
+- Favoritos e bloqueio de mídia.
+- Media Director automático e associação manual por cena.
+- Editor vertical por versão.
+- Render MP4 720×1280 com FFmpeg e textos.
+- Quality Gate básico.
+- Download do vídeo e pacote editorial ZIP.
+
+### Migração da v0.1
+
+Extraia este pacote sobre o repositório atual. O banco SQLite é preservado e as novas tabelas são criadas automaticamente ao iniciar.

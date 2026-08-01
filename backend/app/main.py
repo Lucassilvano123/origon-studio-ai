@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pathlib import Path
 import json, shutil, subprocess, platform
-from .db import init_db, rows, one, execute, log, now, connect
+from .db import init_db, init_media_db, rows, one, execute, log, now, connect
 from .schemas import ProductIn, ProjectIn, BatchIn, ImportUrlIn, GenerateIn, SettingIn
 from .creative import generate_versions, claim_guard
 from .importer import extract
@@ -12,7 +13,7 @@ from .config import STORAGE
 app=FastAPI(title='Origon Studio AI API',version='0.1.0')
 app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*'])
 @app.on_event('startup')
-def startup(): init_db()
+def startup(): init_db(); init_media_db()
 @app.get('/health')
 def health(): return {'status':'healthy','service':'origon-studio-ai'}
 @app.get('/api/dashboard')
@@ -96,3 +97,72 @@ def diagnostics():
     return {'overall':'ready' if cmd('ffmpeg')['ok'] else 'warning','python':platform.python_version(),'ffmpeg':cmd('ffmpeg'),'ffprobe':cmd('ffprobe'),'piper':cmd('piper'),'database':{'ok':STORAGE.joinpath('database','origon.db').exists(),'path':str(STORAGE.joinpath('database','origon.db'))},'storage':{'path':str(STORAGE),'freeGB':round(disk.free/1024**3,2)},'providers':{'externalEnabled':False,'webllm':'browser-check-required','comfyui':'not-configured','huggingface':'not-configured'}}
 @app.post('/api/repair')
 def repair(): init_db(); return {'ok':True,'message':'Banco e pastas verificados.'}
+
+
+from .media_service import save_upload
+from .render_service import render_version, export_package, editorial
+
+app.mount('/storage/media', StaticFiles(directory=STORAGE/'media'), name='media')
+
+@app.get('/api/products/{pid}/media')
+def product_media(pid:int):
+    return rows('SELECT * FROM media WHERE product_id=? ORDER BY favorite DESC,id DESC',(pid,))
+
+@app.post('/api/products/{pid}/media')
+async def upload_media(pid:int, files:list[UploadFile]=File(...)):
+    get_product(pid); result=[]
+    for item in files:
+        try:
+            meta=save_upload(pid,item.filename or 'media',item.file)
+            mid=execute('INSERT INTO media(product_id,original_name,stored_name,media_type,mime_type,size_bytes,width,height,duration,has_audio,origin,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,"upload",?)',(pid,item.filename,meta['stored_name'],meta['media_type'],item.content_type,meta['size_bytes'],meta['width'],meta['height'],meta['duration'],meta['has_audio'],now()))
+            result.append(one('SELECT * FROM media WHERE id=?',(mid,)))
+        finally: await item.close()
+    log('product',pid,'media_uploaded',{'count':len(result)}); return result
+
+@app.patch('/api/media/{mid}')
+def media_update(mid:int, favorite:bool|None=None, blocked:bool|None=None):
+    m=one('SELECT * FROM media WHERE id=?',(mid,))
+    if not m: raise HTTPException(404,'Mídia não encontrada')
+    execute('UPDATE media SET favorite=?,blocked=? WHERE id=?',(int(favorite) if favorite is not None else m['favorite'],int(blocked) if blocked is not None else m['blocked'],mid)); return one('SELECT * FROM media WHERE id=?',(mid,))
+
+@app.delete('/api/media/{mid}')
+def media_delete(mid:int):
+    m=one('SELECT * FROM media WHERE id=?',(mid,))
+    if not m: raise HTTPException(404,'Mídia não encontrada')
+    path=STORAGE/'media'/str(m['product_id'])/m['stored_name']; path.unlink(missing_ok=True); execute('DELETE FROM media WHERE id=?',(mid,)); return {'ok':True}
+
+@app.get('/api/versions/{vid}/editor')
+def editor_data(vid:int):
+    v=one('SELECT v.*,p.product_id,pr.name product_name FROM versions v JOIN projects p ON p.id=v.project_id JOIN products pr ON pr.id=p.product_id WHERE v.id=?',(vid,))
+    if not v: raise HTTPException(404,'Versão não encontrada')
+    v['script']=json.loads(v['script_json']); v['media']=rows('SELECT * FROM media WHERE product_id=? ORDER BY favorite DESC,id',(v['product_id'],)); v['assignments']=rows('SELECT * FROM scene_media WHERE version_id=?',(vid,)); return v
+
+@app.put('/api/versions/{vid}/scene/{order}/media/{mid}')
+def assign_media(vid:int,order:int,mid:int):
+    execute('INSERT OR REPLACE INTO scene_media(version_id,scene_order,media_id,created_at) VALUES(?,?,?,?)',(vid,order,mid,now())); return {'ok':True}
+
+@app.post('/api/versions/{vid}/auto-assign')
+def auto_assign(vid:int):
+    data=editor_data(vid); media=[m for m in data['media'] if not m['blocked']]
+    if not media: raise HTTPException(422,'Adicione mídias ao produto')
+    execute('DELETE FROM scene_media WHERE version_id=?',(vid,))
+    for i,_scene in enumerate(data['script'].get('scenes',[]),1):
+        preferred=next((m for m in media if (i<=2 and m['media_type']=='video')),None) or media[(i-1)%len(media)]
+        execute('INSERT INTO scene_media(version_id,scene_order,media_id,created_at) VALUES(?,?,?,?)',(vid,i,preferred['id'],now()))
+    return editor_data(vid)
+
+@app.post('/api/versions/{vid}/render')
+def render(vid:int):
+    try:
+        output,quality=render_version(vid); return {'ok':True,'download':f'/api/versions/{vid}/video','quality':quality,'editorial':editorial(vid)}
+    except Exception as e: raise HTTPException(500,f'Falha na renderização: {e}')
+
+@app.get('/api/versions/{vid}/video')
+def download_video(vid:int):
+    v=one('SELECT output_path FROM versions WHERE id=?',(vid,)); path=Path(v['output_path']) if v and v['output_path'] else None
+    if not path or not path.exists(): raise HTTPException(404,'Vídeo ainda não foi renderizado')
+    return FileResponse(path,media_type='video/mp4',filename=path.name)
+
+@app.get('/api/versions/{vid}/export')
+def export(vid:int):
+    z=export_package(vid); return FileResponse(z,media_type='application/zip',filename=z.name)
